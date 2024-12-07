@@ -6,6 +6,12 @@ ffi = true
 fs_permissions = [{ access = "read-write", path = ".forge-snapshots/"}]
 solc_version = "0.8.26"
 evm_version = "cancun"
-
+via_ir = true
+optimizer = true
+optimizer_runs = 1000000
+remappings = [
+    "v4-core/=lib/v4-core/src/",
+    "v4-periphery/=lib/v4-periphery/src/"
+]
 
 # See more config options https://github.com/foundry-rs/foundry/tree/master/config

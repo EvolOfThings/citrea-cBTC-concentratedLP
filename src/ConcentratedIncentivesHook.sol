@@ -15,20 +15,29 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 contract ConcentratedIncentivesHook is BaseHook {
     using PoolIdLibrary for PoolKey;
 
+    bytes internal constant ZERO_BYTES = bytes("");
+    IPoolManager public immutable manager;
+
     // Pool initialization flag
     mapping(PoolId => bool) public initialized;
     
     // Token addresses for the pool
     Currency public immutable token0;
     Currency public immutable token1;
+
+    // Governance token for rewards
+    IERC20 public immutable governanceToken;
+
     uint24 public constant FEE_TIER = 3000; // 0.3% fee tier
+    uint256 public constant REWARD_AMOUNT = 100 * 1e18;
+    uint256 public constant CLAIM_COOLDOWN = 24 hours;
 
     // Track LP positions and their ranges
     struct LiquidityPosition {
         bool isActive;
         int24 tickLower;
         int24 tickUpper;
-        uint256 lastClaimTime; // for governance token rewards
+        uint256 lastClaimTime;
     }
 
     // Target range for incentives
@@ -40,28 +49,30 @@ contract ConcentratedIncentivesHook is BaseHook {
     // Mappings
     mapping(PoolId => mapping(address => LiquidityPosition)) public positions;
     mapping(PoolId => IncentiveRange) public incentiveRanges;
-    
-    // Fixed reward amount per claim
-    uint256 public constant REWARD_AMOUNT = 100 * 1e18;
-    uint256 public constant CLAIM_COOLDOWN = 24 hours;
-
-    // Governance token for rewards
-    IERC20 public immutable governanceToken;
 
     event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper);
     event LiquidityPositionUpdated(address indexed provider, PoolId indexed poolId, int24 tickLower, int24 tickUpper);
+    event PositionDeactivated(address indexed provider, PoolId indexed poolId);
     event RewardsClaimed(address indexed provider, PoolId indexed poolId, uint256 amount);
     event IncentiveRangeUpdated(PoolId indexed poolId, int24 newTickLower, int24 newTickUpper);
 
     constructor(
-        IPoolManager _poolManager, 
-        IERC20 _governanceToken, 
-        Currency _token0, 
+        IPoolManager _poolManager,
+        IERC20 _governanceToken,
+        Currency _token0,
         Currency _token1
     ) BaseHook(_poolManager) {
-        token0 = _token0;
-        token1 = _token1;
         governanceToken = _governanceToken;
+        manager = _poolManager;
+        
+        // Ensure token0 address is less than token1 address
+        if (_token0.toId() < _token1.toId()) {
+            token0 = _token0;
+            token1 = _token1;
+        } else {
+            token0 = _token1;
+            token1 = _token0;
+        }
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -76,7 +87,7 @@ contract ConcentratedIncentivesHook is BaseHook {
             afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeAddLiquidityReturnDelta: false,
+            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -84,13 +95,21 @@ contract ConcentratedIncentivesHook is BaseHook {
     }
 
     function beforeInitialize(
-        address sender, 
-        PoolKey calldata key, 
-        uint160 sqrtPriceX96
+        address,
+        PoolKey calldata key,
+        uint160
     ) external override returns (bytes4) {
-        // Mark pool as initialized
         initialized[key.toId()] = true;
         return BaseHook.beforeInitialize.selector;
+    }
+
+    function beforeAddLiquidity(
+        address,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external override returns (bytes4) {
+        return BaseHook.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(
@@ -98,18 +117,11 @@ contract ConcentratedIncentivesHook is BaseHook {
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
         BalanceDelta,
-        bytes calldata hookData
-    ) external override returns (bytes4) {
-        PoolId poolId = key.toId();
-        positions[poolId][sender] = LiquidityPosition({
-            isActive: true,
-            tickLower: params.tickLower,
-            tickUpper: params.tickUpper,
-            lastClaimTime: 0
-        });
-
-        emit LiquidityPositionUpdated(sender, poolId, params.tickLower, params.tickUpper);
-        return BaseHook.afterAddLiquidity.selector;
+        BalanceDelta,
+        bytes calldata
+    ) external override returns (bytes4, BalanceDelta) {
+        _updatePosition(key.toId(), sender, params.tickLower, params.tickUpper);
+        return (BaseHook.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
     function beforeRemoveLiquidity(
@@ -118,16 +130,26 @@ contract ConcentratedIncentivesHook is BaseHook {
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        PoolId poolId = key.toId();
-        positions[poolId][sender].isActive = false;
+        _deactivatePosition(key.toId(), sender);
         return BaseHook.beforeRemoveLiquidity.selector;
     }
 
-    // initialize Pool function with percentage range, called externally after deploying the contract
-    function initializePool(
-        uint256 initialPrice, 
-        uint8 percentageRange
-        ) external returns (PoolId) {
+    function _updatePosition(PoolId poolId, address provider, int24 tickLower, int24 tickUpper) internal {
+        positions[poolId][provider] = LiquidityPosition({
+            isActive: true,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            lastClaimTime: block.timestamp
+        });
+        emit LiquidityPositionUpdated(provider, poolId, tickLower, tickUpper);
+    }
+
+    function _deactivatePosition(PoolId poolId, address provider) internal {
+        positions[poolId][provider].isActive = false;
+        emit PositionDeactivated(provider, poolId);
+    }
+
+    function initializePool(uint256 initialPrice, uint8 percentageRange) external returns (PoolId) {
         PoolKey memory poolKey = PoolKey({
             currency0: token0,
             currency1: token1,
@@ -135,7 +157,7 @@ contract ConcentratedIncentivesHook is BaseHook {
             tickSpacing: 60,
             hooks: IHooks(address(this)) // hookContract
         });
-        
+
         // generates a unique identifier for the pool based on its key properties 
         // and that can be used to reference this specific pool.
         PoolId poolId = poolKey.toId();
@@ -143,15 +165,11 @@ contract ConcentratedIncentivesHook is BaseHook {
 
         // Convert price to sqrtPriceX96 format
         uint160 sqrtPriceX96 = calculateSqrtPriceX96(initialPrice);
-        (int24 initialTickLower, int24 initialTickUpper) = getPriceTickRange(
-            initialPrice,
-            percentageRange
-        );
-
+        (int24 initialTickLower, int24 initialTickUpper) = getPriceTickRange(initialPrice, percentageRange);
 
         poolManager.initialize(poolKey, sqrtPriceX96); // Here's where we set the initial price
         initialized[poolId] = true;
-        
+
         // Set initial incentive range
         incentiveRanges[poolId] = IncentiveRange({
             tickLower: initialTickLower,
@@ -162,35 +180,6 @@ contract ConcentratedIncentivesHook is BaseHook {
         return poolId;
     }
 
-    // function to calculate sqrtPriceX96 from regular price
-    function calculateSqrtPriceX96(uint256 price) public pure returns (uint160) {
-        // price = price of token0(cBTC) in terms of token1(USDC)
-        // if cBTC = 40,000 USDC, price = 40,000
-        
-        // square root of the price
-        uint256 sqrtPrice = sqrt(price);
-        
-        // Multiply by 2^96 and convert to uint160
-        return uint160((sqrtPrice * (1 << 96)) / (1 << 48));
-    }
-
-    // function to calculate square root
-    function sqrt(uint256 x) internal pure returns (uint256) {
-        if (x == 0) return 0;
-        
-        uint256 result = 1;
-        uint256 x1 = x;
-        uint256 x2 = x;
-        
-        while (x1 > result) {
-            x1 = result;
-            x2 = (x2 + (x / x2)) >> 1;
-            result = x2;
-        }
-        
-        return result;
-    }
-
     function getPriceTickRange(uint256 basePrice, uint8 percentageRange) public pure returns (int24 tickLower, int24 tickUpper) {
         require(percentageRange > 0 && percentageRange <= 100, "Invalid range percentage");
         
@@ -198,22 +187,11 @@ contract ConcentratedIncentivesHook is BaseHook {
         uint256 lowerPrice = basePrice * (100 - percentageRange) / 100;
         uint256 upperPrice = basePrice * (100 + percentageRange) / 100;
         
-        // Convert to sqrt price X96 format
-        uint160 sqrtPriceLowerX96 = calculateSqrtPriceX96(lowerPrice);
-        uint160 sqrtPriceUpperX96 = calculateSqrtPriceX96(upperPrice);
-        
-        // Get nearest valid ticks
-        tickLower = TickMath.getTickAtSqrtRatio(sqrtPriceLowerX96);
-        tickUpper = TickMath.getTickAtSqrtRatio(sqrtPriceUpperX96);
+        return (TickMath.getTickAtSqrtPrice(calculateSqrtPriceX96(lowerPrice)), TickMath.getTickAtSqrtPrice(calculateSqrtPriceX96(upperPrice)));
     }
 
-    // Check if position is within incentivized range and returns true or false
-    function isInIncentivizedRange(
-        PoolId poolId,
-        int24 tickLower,
-        int24 tickUpper
-    ) public view returns (bool) {
-        IncentiveRange memory range = incentiveRanges[poolId];
+    function isInIncentivizedRange(PoolId poolId, int24 tickLower, int24 tickUpper) public view returns (bool) {
+        IncentiveRange storage range = incentiveRanges[poolId];
         return tickLower >= range.tickLower && tickUpper <= range.tickUpper;
     }
 
@@ -221,24 +199,21 @@ contract ConcentratedIncentivesHook is BaseHook {
     function claimRewards(PoolKey calldata key) external {
         PoolId poolId = key.toId();
         LiquidityPosition storage position = positions[poolId][msg.sender];
-        
-        require(position.isActive, "Not an active liquidity provider");
-        require(
-            block.timestamp >= position.lastClaimTime + CLAIM_COOLDOWN,
-            "Cooldown period not met"
-        );
+        require(position.isActive, "No active position");
+        require(block.timestamp >= position.lastClaimTime + CLAIM_COOLDOWN, "Cooldown not elapsed");
         require(
             isInIncentivizedRange(poolId, position.tickLower, position.tickUpper),
             "Position not in incentivized range"
         );
 
         position.lastClaimTime = block.timestamp;
-        require(
-            governanceToken.transfer(msg.sender, REWARD_AMOUNT),
-            "Reward transfer failed"
-        );
+        governanceToken.transfer(msg.sender, REWARD_AMOUNT);
 
         emit RewardsClaimed(msg.sender, poolId, REWARD_AMOUNT);
+    }
+
+    function calculateSqrtPriceX96(uint256 price) internal pure returns (uint160) {
+        return uint160(int160(int256(price)) << 96);
     }
 
     // Admin function to update incentive range
