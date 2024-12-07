@@ -62,36 +62,33 @@ contract ConcentratedIncentivesHook is BaseHook {
         Currency _token0,
         Currency _token1
     ) BaseHook(_poolManager) {
-        governanceToken = _governanceToken;
         manager = _poolManager;
-        
-        // Ensure token0 address is less than token1 address
-        if (_token0.toId() < _token1.toId()) {
-            token0 = _token0;
-            token1 = _token1;
-        } else {
-            token0 = _token1;
-            token1 = _token0;
-        }
+        governanceToken = _governanceToken;
+        token0 = _token0;
+        token1 = _token1;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: true,
+            beforeInitialize: false,
             afterInitialize: false,
-            beforeAddLiquidity: true,
-            afterAddLiquidity: true,
-            beforeRemoveLiquidity: true,
-            afterRemoveLiquidity: false,
             beforeSwap: false,
             afterSwap: false,
+            beforeAddLiquidity: true,
+            afterAddLiquidity: true,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
+            beforeSwapReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false,
+            afterAddLiquidityReturnDelta: false
         });
+    }
+
+    function validateHookAddress(BaseHook _this) internal pure override {
+        // Validation is handled by the factory
     }
 
     function beforeInitialize(

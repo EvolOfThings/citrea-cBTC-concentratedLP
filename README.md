@@ -65,3 +65,13 @@ Key Features:
 - Implements concentrated liquidity incentives within specific price ranges
 
 This hook is designed to incentivize liquidity providers to provide liquidity within specific price ranges by offering rewards in the form of governance tokens. It's particularly useful for maintaining tight liquidity around specific price points.
+
+
+
+POOL_MANAGER_ADDRESS: 0x8c4bcbe6b9ef47855f97e675296fa3f6fafa5f1a
+GOVERNANCE_TOKEN_ADDRESS: 0x71D2521BeC8EBB3DB2983337d7fAa056886A8D08
+TOKEN0_ADDRESS: 0x28665DC05b3E3603F81A86aac434fe4953877be1 // cBTC
+TOKEN1_ADDRESS: 0x7B6db83ad69E6afe0bfF063eeA561C511a05eFfb // USDC
+
+HookFactory: 0x9015B7d32A846c01c78A18aF225c2FaA7FcDEA25
+Hook: 0xeef055936d3bb1cd2b865975bba95544a90e8c65
