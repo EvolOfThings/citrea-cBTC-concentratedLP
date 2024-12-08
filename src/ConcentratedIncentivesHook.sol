@@ -6,7 +6,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -91,21 +91,23 @@ contract ConcentratedIncentivesHook is BaseHook {
         // Validation is handled by the factory
     }
 
-    function beforeInitialize(
-        address,
-        PoolKey calldata key,
-        uint160
-    ) external override returns (bytes4) {
-        initialized[key.toId()] = true;
-        return BaseHook.beforeInitialize.selector;
-    }
-
     function beforeAddLiquidity(
-        address,
-        PoolKey calldata,
-        IPoolManager.ModifyLiquidityParams calldata,
-        bytes calldata
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        bytes calldata data
     ) external override returns (bytes4) {
+        PoolId poolId = key.toId();
+        
+        // Update position tracking
+        positions[poolId][sender] = LiquidityPosition({
+            isActive: true,
+            tickLower: params.tickLower,
+            tickUpper: params.tickUpper,
+            lastClaimTime: block.timestamp
+        });
+
+        emit LiquidityPositionUpdated(sender, poolId, params.tickLower, params.tickUpper);
         return BaseHook.beforeAddLiquidity.selector;
     }
 
@@ -113,50 +115,23 @@ contract ConcentratedIncentivesHook is BaseHook {
         address sender,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bytes calldata hookData
     ) external override returns (bytes4, BalanceDelta) {
-        _updatePosition(key.toId(), sender, params.tickLower, params.tickUpper);
-        return (BaseHook.afterAddLiquidity.selector, BalanceDelta.wrap(0));
-    }
-
-    function beforeRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata,
-        bytes calldata
-    ) external override returns (bytes4) {
-        _deactivatePosition(key.toId(), sender);
-        return BaseHook.beforeRemoveLiquidity.selector;
-    }
-
-    function _updatePosition(PoolId poolId, address provider, int24 tickLower, int24 tickUpper) internal {
-        positions[poolId][provider] = LiquidityPosition({
-            isActive: true,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            lastClaimTime: block.timestamp
-        });
-        emit LiquidityPositionUpdated(provider, poolId, tickLower, tickUpper);
-    }
-
-    function _deactivatePosition(PoolId poolId, address provider) internal {
-        positions[poolId][provider].isActive = false;
-        emit PositionDeactivated(provider, poolId);
+        // We can add additional logic here if needed
+        return (BaseHook.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
     function initializePool(uint256 initialPrice, uint8 percentageRange) external returns (PoolId) {
         PoolKey memory poolKey = PoolKey({
             currency0: token0,
             currency1: token1,
-            fee: FEE_TIER, //lpFee
+            fee: FEE_TIER,
             tickSpacing: 60,
-            hooks: IHooks(address(this)) // hookContract
+            hooks: IHooks(address(this))
         });
 
-        // generates a unique identifier for the pool based on its key properties 
-        // and that can be used to reference this specific pool.
         PoolId poolId = poolKey.toId();
         require(!initialized[poolId], "Pool already initialized");
 
@@ -164,7 +139,7 @@ contract ConcentratedIncentivesHook is BaseHook {
         uint160 sqrtPriceX96 = calculateSqrtPriceX96(initialPrice);
         (int24 initialTickLower, int24 initialTickUpper) = getPriceTickRange(initialPrice, percentageRange);
 
-        poolManager.initialize(poolKey, sqrtPriceX96); // Here's where we set the initial price
+        poolManager.initialize(poolKey, sqrtPriceX96);
         initialized[poolId] = true;
 
         // Set initial incentive range
@@ -192,7 +167,6 @@ contract ConcentratedIncentivesHook is BaseHook {
         return tickLower >= range.tickLower && tickUpper <= range.tickUpper;
     }
 
-    // Claim rewards if position is within range
     function claimRewards(PoolKey calldata key) external {
         PoolId poolId = key.toId();
         LiquidityPosition storage position = positions[poolId][msg.sender];
@@ -210,10 +184,16 @@ contract ConcentratedIncentivesHook is BaseHook {
     }
 
     function calculateSqrtPriceX96(uint256 price) internal pure returns (uint160) {
-        return uint160(int160(int256(price)) << 96);
+        // Price is scaled by 100
+        // Convert to Q96 format for sqrt price (price * 2^96)
+        uint256 priceQ96 = price * (1 << 96) / 100;
+        
+        // Ensure we don't overflow uint160
+        require(priceQ96 <= type(uint160).max, "Price overflow");
+        
+        return uint160(priceQ96);
     }
 
-    // Admin function to update incentive range
     function updateIncentiveRange(
         PoolKey calldata key,
         int24 newTickLower,
